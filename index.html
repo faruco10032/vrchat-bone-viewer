@@ -464,6 +464,17 @@
       }, [playing, frames, playMode]);
 
       const frameData = frames[current];
+      const getDataFps = (idx) => {
+        if (frames.length < 2 || idx < 0 || idx >= frames.length) return null;
+        const prevIdx = Math.max(0, idx - 1);
+        const nextIdx = Math.min(frames.length - 1, idx + 1);
+        let dt = 0;
+        if (prevIdx !== idx) dt = frames[idx].time - frames[prevIdx].time;
+        if (dt <= 0 && nextIdx !== idx) dt = frames[nextIdx].time - frames[idx].time;
+        if (dt <= 0) return null;
+        return 1 / dt;
+      };
+      const dataFps = getDataFps(current);
 
       return (
         <div style={{
@@ -533,6 +544,9 @@
               <div style={{ color:"#2a6a8a" }}>FRAMES <span style={{ color:"#7ecfff", float:"right" }}>{frames.length}</span></div>
               <div style={{ color:"#2a6a8a" }}>FRAME  <span style={{ color:"#7ecfff", float:"right" }}>{current}</span></div>
               <div style={{ color:"#2a6a8a" }}>TIME   <span style={{ color:"#7ecfff", float:"right" }}>{frameData ? frameData.time.toFixed(3) : "---"}s</span></div>
+              {playMode === "realtime" && (
+                <div style={{ color:"#2a6a8a" }}>DATA FPS <span style={{ color:"#69ff96", float:"right" }}>{dataFps ? dataFps.toFixed(2) : "---"}</span></div>
+              )}
               <div style={{ color:"#2a6a8a" }}>BONES  <span style={{ color:"#7ecfff", float:"right" }}>22</span></div>
               {frameData?.bones?.Hips && (
                 <>
