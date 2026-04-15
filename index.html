@@ -50,20 +50,47 @@
       const logTsPattern = /^(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})/;
       const framePattern = /\[MOTIONLOG\] F:(\d+) T:([-\d.]+) P:(\d+)/;
       const bfPattern = /\[BoneLogger\] Frame:(\d+) Time:([-\d.]+)/;
+      const sessionStartPattern = /\[MOTIONLOG\] SESSION_START/;
       const entries = []; let lastTs = "";
       const lines = text.split(/\r?\n/);
+
+      // Also track SESSION_START lines to use as segment start boundaries
+      const sessionStartLines = [];
       for (let i = 0; i < lines.length; i++) {
         const ts = lines[i].match(logTsPattern); if (ts) lastTs = ts[1];
+        if (lines[i].match(sessionStartPattern)) sessionStartLines.push(i);
         const fm = lines[i].match(framePattern); if (fm) { entries.push({ li: i, t: parseFloat(fm[2]), ts: lastTs }); continue; }
         const bf = lines[i].match(bfPattern); if (bf) { entries.push({ li: i, t: parseFloat(bf[2]), ts: lastTs }); }
       }
       if (!entries.length) return [{ startLine: 0, endLine: lines.length - 1, logTs: "", durationSec: 0 }];
+
       const segs = []; let s = 0;
       for (let i = 1; i < entries.length; i++) {
         const dt = entries[i].t - entries[i-1].t;
-        if (dt < -1.0 || dt > TIME_GAP_THRESHOLD) { segs.push({ startLine: entries[s].li, endLine: entries[i-1].li, logTs: entries[s].ts, durationSec: entries[i-1].t - entries[s].t }); s = i; }
+        if (dt < -1.0 || dt > TIME_GAP_THRESHOLD) {
+          segs.push({ startLine: entries[s].li, endLine: entries[i-1].li, logTs: entries[s].ts, durationSec: entries[i-1].t - entries[s].t });
+          s = i;
+        }
       }
       segs.push({ startLine: entries[s].li, endLine: entries[entries.length-1].li, logTs: entries[s].ts, durationSec: entries[entries.length-1].t - entries[s].t });
+
+      // Extend startLine backward to include SESSION_START/PLAYER lines
+      for (let si = 0; si < segs.length; si++) {
+        // Find the closest SESSION_START line that is before (or at) this segment's first frame
+        let best = segs[si].startLine;
+        for (let j = sessionStartLines.length - 1; j >= 0; j--) {
+          if (sessionStartLines[j] <= segs[si].startLine) { best = sessionStartLines[j]; break; }
+        }
+        // Also include a few lines before SESSION_START for PLAYER/EVENT lines
+        segs[si].startLine = Math.max(0, best - 5);
+      }
+
+      // Compute endLine as the line before the next segment's startLine (to avoid overlap)
+      for (let si = 0; si < segs.length - 1; si++) {
+        segs[si].endLine = segs[si + 1].startLine - 1;
+      }
+      segs[segs.length - 1].endLine = lines.length - 1;
+
       return segs;
     }
 
@@ -111,6 +138,25 @@
         fd.players[row.player_id][row.bone] = { x: parseFloat(row.pos_x), y: parseFloat(row.pos_y), z: parseFloat(row.pos_z) };
       }
       return Array.from(frameMap.values()).sort((a,b) => a.frame - b.frame);
+    }
+
+    // ========== CSV Export ==========
+    function exportRecordingCSV(parsedSeg, checkedPlayers, playerNames, segLabel) {
+      if (!parsedSeg || !parsedSeg.rows.length) return;
+      const active = Object.keys(checkedPlayers).filter(p => checkedPlayers[p]);
+      const rows = parsedSeg.rows.filter(r => active.includes(r.player_id) && r.bone && !r.bone.startsWith("Track"));
+
+      let csv = "frame,unity_time,player_id,player_name,bone,pos_x,pos_y,pos_z\n";
+      for (const r of rows) {
+        csv += [r.frame, r.unity_time, r.player_id, (playerNames[r.player_id]||"").replace(/,/g,"_"), r.bone, r.pos_x, r.pos_y, r.pos_z].join(",") + "\n";
+      }
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "bone_data_" + (segLabel || "recording").replace(/[\/: ]/g, "_") + ".csv";
+      a.click();
+      URL.revokeObjectURL(url);
     }
 
     // ==================== MAIN ====================
@@ -294,7 +340,7 @@
         if (!rawText || !segments.length) return;
         const seg = segments[selectedSeg]; if (!seg) return;
         const lines = rawText.split(/\r?\n/);
-        const block = lines.slice(seg.startLine, seg.endLine + 500).join("\n");
+        const block = lines.slice(seg.startLine, seg.endLine + 1).join("\n");
         let parsed = block.includes("[MOTIONLOG]") ? parseMotionLogBlock(block) : parseBoneLoggerBlock(block);
         parsed.playerNames = { ...globalPlayerNames, ...parsed.playerNames };
 
@@ -385,6 +431,8 @@
               </label>
               <button onClick={openLog} style={{padding:"5px 14px",border:"1px solid #69ff96",color:"#69ff96",fontSize:11,letterSpacing:2,cursor:"pointer",background:"rgba(105,255,150,0.05)"}}>LOG</button>
               <input ref={logInputRef} type="file" accept=".txt,.log" onChange={handleLog} style={{display:"none"}} />
+              {loaded && <button onClick={() => exportRecordingCSV(parsedSeg, checkedPlayers, playerNames, segments[selectedSeg] ? fmtTs(segments[selectedSeg].logTs) : "data")}
+                style={{padding:"5px 14px",border:"1px solid #ffe066",color:"#ffe066",fontSize:11,letterSpacing:2,cursor:"pointer",background:"rgba(255,224,102,0.05)"}}>CSV</button>}
               {fileName && <span style={{fontSize:10,color:"#2a6a8a",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{fileName}</span>}
             </div>
           </div>
