@@ -204,10 +204,11 @@
       const playModeRef = useRef("fps"), playSpeedRef = useRef(1), followModeRef = useRef(true);
 
       // Segments (parsed from log)
-      const [segments, setSegments] = useState([]); // { startLine, endLine, logTs, durationSec }
+      const [segments, setSegments] = useState([]);
       const [selectedSeg, setSelectedSeg] = useState(0);
-      const [parsedSeg, setParsedSeg] = useState(null); // { rows, players, playerNames }
+      const [parsedSeg, setParsedSeg] = useState(null);
       const [rawText, setRawText] = useState("");
+      const [globalPlayerNames, setGlobalPlayerNames] = useState({}); // PLAYER名はログ全体から取得
 
       const [players, setPlayers] = useState([]);
       const [playerNames, setPlayerNames] = useState({});
@@ -347,21 +348,25 @@
         if (!seg) return;
 
         const lines = rawText.split(/\r?\n/);
-        const block = lines.slice(seg.startLine, seg.endLine + 500).join("\n"); // include trailing bone data
+        const block = lines.slice(seg.startLine, seg.endLine + 500).join("\n");
 
         let parsed;
         if (block.includes("[MOTIONLOG]")) parsed = parseMotionLogBlock(block);
         else parsed = parseBoneLoggerFormat(block);
 
+        // グローバルPLAYER名をマージ（セグメント内で見つからなかった名前を補完）
+        const mergedNames = { ...globalPlayerNames, ...parsed.playerNames };
+        parsed.playerNames = mergedNames;
+
         setParsedSeg(parsed);
         setPlayers(parsed.players);
-        setPlayerNames(parsed.playerNames);
+        setPlayerNames(mergedNames);
         const firstP = parsed.players.length > 0 ? parsed.players[0] : "0";
         setSelectedPlayer(firstP);
         const f = buildFrames(parsed.rows, firstP);
         setFrames(f); setCurrent(0); setPlaying(false); setLoaded(f.length > 0);
         initSkeleton();
-        updateNameLabel(parsed.playerNames[firstP] || `Player ${firstP}`);
+        updateNameLabel(mergedNames[firstP] || `Player ${firstP}`);
 
         // Grid
         const scene = sceneRef.current;
@@ -370,7 +375,7 @@
           for (const fr of f) { const h = fr.bones["Hips"]; if (!h) continue; minX = Math.min(minX, h.x); maxX = Math.max(maxX, h.x); minZ = Math.min(minZ, h.z); maxZ = Math.max(maxZ, h.z); cx += h.x; cz += h.z; cnt++; }
           if (cnt > 0) { cx /= cnt; cz /= cnt; const gs = Math.ceil(Math.max(maxX - minX, maxZ - minZ, 4) * 1.5 / 0.5) * 0.5; scene.remove(gridRef.current); const ng = new THREE.GridHelper(gs, Math.round(gs / 0.5), 0x1a2a3a, 0x0d1a24); ng.position.set(cx, -0.05, cz); scene.add(ng); gridRef.current = ng; }
         }
-      }, [selectedSeg, segments, rawText, initSkeleton, updateNameLabel]);
+      }, [selectedSeg, segments, rawText, globalPlayerNames, initSkeleton, updateNameLabel]);
 
       // Player change
       useEffect(() => {
@@ -389,6 +394,15 @@
         setRawText(text);
         setFileName(file.name);
 
+        // ログ全体からPLAYER情報を先に抽出（全セグメントで共有）
+        const globalNames = {};
+        const playerPat = /\[MOTIONLOG\] PLAYER ID:(\d+) Name:(.+?) IsVR:(true|false)/;
+        for (const line of text.split(/\r?\n/)) {
+          const pm = line.match(playerPat);
+          if (pm) globalNames[pm[1]] = pm[2].trim();
+        }
+        setGlobalPlayerNames(globalNames);
+
         if (file.name.endsWith(".csv")) {
           const parsed = parseCSV(text);
           setParsedSeg(parsed);
@@ -405,7 +419,6 @@
         const segs = detectSegments(text);
         setSegments(segs);
         setSelectedSeg(0);
-        // Segment 0 will be parsed by the useEffect above
       };
 
       const handleCSVFile = async (e) => { const f = e.target.files[0]; if (f) await handleFile(f); e.target.value = ""; };
