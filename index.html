@@ -365,15 +365,29 @@
         }
       }, [selectedSeg, segments, rawText, globalPlayerNames, rebuildFrames]);
 
-      // ========== Player checkbox toggle ==========
+      // ========== Player checkbox toggle (preserve playback position) ==========
       const togglePlayer = useCallback((pid) => {
         setCheckedPlayers(prev => {
           const next = { ...prev, [pid]: !prev[pid] };
-          const f = rebuildFrames(parsedSeg, next, playerNames);
-          setFrames(f); setCurrent(0); setPlaying(false);
+          const newFrames = rebuildFrames(parsedSeg, next, playerNames);
+          setFrames(oldFrames => {
+            // Find closest frame by time to preserve position
+            const oldTime = oldFrames[current]?.time;
+            if (oldTime != null && newFrames.length > 0) {
+              let best = 0;
+              let bestDt = Math.abs(newFrames[0].time - oldTime);
+              for (let i = 1; i < newFrames.length; i++) {
+                const dt = Math.abs(newFrames[i].time - oldTime);
+                if (dt < bestDt) { bestDt = dt; best = i; }
+              }
+              setCurrent(best);
+            }
+            return newFrames;
+          });
+          // Do NOT stop playback
           return next;
         });
-      }, [parsedSeg, playerNames, rebuildFrames]);
+      }, [parsedSeg, playerNames, rebuildFrames, current]);
 
       // File load
       const readTextFile = (file) => new Promise((res,rej) => { const r=new FileReader(); r.onload=e=>res(e.target.result||""); r.onerror=rej; r.readAsText(file,"utf-8"); });
@@ -432,7 +446,7 @@
               <button onClick={openLog} style={{padding:"5px 14px",border:"1px solid #69ff96",color:"#69ff96",fontSize:11,letterSpacing:2,cursor:"pointer",background:"rgba(105,255,150,0.05)"}}>LOG</button>
               <input ref={logInputRef} type="file" accept=".txt,.log" onChange={handleLog} style={{display:"none"}} />
               {loaded && <button onClick={() => exportRecordingCSV(parsedSeg, checkedPlayers, playerNames, segments[selectedSeg] ? fmtTs(segments[selectedSeg].logTs) : "data")}
-                style={{padding:"5px 14px",border:"1px solid #ffe066",color:"#ffe066",fontSize:11,letterSpacing:2,cursor:"pointer",background:"rgba(255,224,102,0.05)"}}>CSV</button>}
+                style={{padding:"5px 14px",border:"1px solid #ffe066",color:"#ffe066",fontSize:11,letterSpacing:2,cursor:"pointer",background:"rgba(255,224,102,0.05)"}}>EXPORT</button>}
               {fileName && <span style={{fontSize:10,color:"#2a6a8a",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{fileName}</span>}
             </div>
           </div>
