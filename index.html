@@ -169,6 +169,8 @@
       for (const row of filtered) {
         const f = parseInt(row.frame);
         if (isNaN(f)) continue;
+        // Skip tracking data (TrackHead etc.) - only show bone data
+        if (row.bone && row.bone.startsWith("Track")) continue;
         if (!frameMap.has(f)) {
           frameMap.set(f, { frame: f, time: parseFloat(row.unity_time), bones: {} });
         }
@@ -275,15 +277,26 @@
         frameObjs.current = { joints: {}, bones: {} };
         const allBones = new Set();
         BONE_CONNECTIONS.forEach(([a, b]) => { allBones.add(a); allBones.add(b); });
-        // Add tracking data points
-        ["TrackHead","TrackLHand","TrackRHand"].forEach(n => allBones.add(n));
         allBones.forEach(name => {
-          const isTrack = name.startsWith("Track");
-          const geo = new THREE.SphereGeometry(isTrack ? 0.025 : 0.018, 12, 12);
-          const mat = new THREE.MeshStandardMaterial({ color: getBoneColor(name), emissive: getBoneColor(name), emissiveIntensity: isTrack ? 0.8 : 0.5, roughness: 0.3, metalness: 0.7 });
+          const geo = new THREE.SphereGeometry(0.018, 12, 12);
+          const mat = new THREE.MeshStandardMaterial({ color: getBoneColor(name), emissive: getBoneColor(name), emissiveIntensity: 0.5, roughness: 0.3, metalness: 0.7 });
           const mesh = new THREE.Mesh(geo, mat); mesh.visible = false; scene.add(mesh);
           frameObjs.current.joints[name] = mesh;
         });
+        // Player name label sprite (above head)
+        if (!frameObjs.current.nameLabel) {
+          const canvas = document.createElement("canvas");
+          canvas.width = 256; canvas.height = 64;
+          const tex = new THREE.CanvasTexture(canvas);
+          const spriteMat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+          const sprite = new THREE.Sprite(spriteMat);
+          sprite.scale.set(0.6, 0.15, 1);
+          sprite.visible = false;
+          scene.add(sprite);
+          frameObjs.current.nameLabel = sprite;
+          frameObjs.current.nameLabelCanvas = canvas;
+          frameObjs.current.nameLabelTex = tex;
+        }
         BONE_CONNECTIONS.forEach(([a, b]) => {
           const key = `${a}-${b}`;
           const geo = new THREE.CylinderGeometry(0.006, 0.006, 1, 8);
@@ -293,12 +306,28 @@
         });
       }, []);
 
+      const updateNameLabel = useCallback((text) => {
+        const canvas = frameObjs.current.nameLabelCanvas;
+        const tex = frameObjs.current.nameLabelTex;
+        if (!canvas || !tex) return;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, 256, 64);
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.roundRect(0, 8, 256, 48, 8); ctx.fill();
+        ctx.font = "bold 24px 'Courier New', monospace";
+        ctx.fillStyle = "#00e5ff";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(text, 128, 32, 250);
+        tex.needsUpdate = true;
+      }, []);
+
       const renderFrame = useCallback((frameData) => {
         if (!frameData) return;
         const bones = frameData.bones; const jo = frameObjs.current.joints; const bo = frameObjs.current.bones;
         const hip = bones["Hips"];
         if (hip && followModeRef.current) { lookTarget.current.set(hip.x, hip.y, hip.z); updateCamera(); }
         Object.entries(jo).forEach(([name, mesh]) => {
+          if (name.startsWith("Track")) { mesh.visible = false; return; } // Skip tracking points
           const b = bones[name];
           if (b && !(b.x === 0 && b.y === 0 && b.z === 0)) { mesh.position.set(b.x, b.y, b.z); mesh.visible = true; }
           else { mesh.visible = false; }
@@ -314,17 +343,28 @@
           cyl.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3().subVectors(pb, pa).normalize());
           cyl.visible = true;
         });
+        // Name label above head
+        const nameSprite = frameObjs.current.nameLabel;
+        const head = bones["Head"];
+        if (nameSprite && head && !(head.x === 0 && head.y === 0 && head.z === 0)) {
+          nameSprite.position.set(head.x, head.y + 0.25, head.z);
+          nameSprite.visible = true;
+        } else if (nameSprite) {
+          nameSprite.visible = false;
+        }
       }, [updateCamera]);
 
       useEffect(() => { if (frames.length > 0 && frames[current]) renderFrame(frames[current]); }, [current, frames, renderFrame]);
 
-      // Player change -> rebuild frames
+      // Player change -> rebuild frames + update name label
       useEffect(() => {
         if (allRows.length === 0) return;
         const f = buildFrames(allRows, selectedPlayer);
         setFrames(f); setCurrent(0); setPlaying(false);
         initSkeleton();
-      }, [selectedPlayer, allRows, initSkeleton]);
+        const label = playerNames[selectedPlayer] || `Player ${selectedPlayer}`;
+        updateNameLabel(label);
+      }, [selectedPlayer, allRows, playerNames, initSkeleton, updateNameLabel]);
 
       const applyParsed = useCallback((parsed, sourceFileName) => {
         setAllRows(parsed.rows);
@@ -431,7 +471,7 @@
             {/* Legend */}
             <div style={{ position:"absolute", top:12, right:12, background:"rgba(6,13,20,0.85)", border:"1px solid #0d2535", backdropFilter:"blur(6px)", padding:"12px 14px", fontSize:10, letterSpacing:1, lineHeight:2.2 }}>
               <div style={{ color:"#00e5ff", marginBottom:4, fontSize:11, letterSpacing:3 }}>LEGEND</div>
-              {[["SPINE / HEAD","#00e5ff"],["LEFT","#ff6b6b"],["RIGHT","#69ff96"],["HIPS","#ffe066"],["TRACKING","#ff69ff"]].map(([label, color]) => (
+              {[["SPINE / HEAD","#00e5ff"],["LEFT","#ff6b6b"],["RIGHT","#69ff96"],["HIPS","#ffe066"]].map(([label, color]) => (
                 <div key={label} style={{ display:"flex", alignItems:"center", gap:8, color:"#2a6a8a" }}>
                   <div style={{ width:8, height:8, borderRadius:"50%", background:color, boxShadow:`0 0 6px ${color}` }} />{label}
                 </div>
