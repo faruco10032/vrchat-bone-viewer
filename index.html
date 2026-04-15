@@ -13,7 +13,6 @@
 </head>
 <body>
   <div id="root"></div>
-
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -24,48 +23,113 @@
 
     const BONE_CONNECTIONS = [
       ["Hips","Spine"],["Spine","Chest"],["Chest","UpperChest"],["UpperChest","Neck"],["Neck","Head"],
-      ["Chest","Neck"], // fallback if UpperChest missing
-      ["UpperChest","LeftShoulder"],["LeftShoulder","LeftUpperArm"],
-      ["LeftUpperArm","LeftLowerArm"],["LeftLowerArm","LeftHand"],
-      ["UpperChest","RightShoulder"],["RightShoulder","RightUpperArm"],
-      ["RightUpperArm","RightLowerArm"],["RightLowerArm","RightHand"],
-      ["Chest","LeftShoulder"],["Chest","RightShoulder"], // fallback
-      ["Hips","LeftUpperLeg"],["LeftUpperLeg","LeftLowerLeg"],
-      ["LeftLowerLeg","LeftFoot"],["LeftFoot","LeftToes"],
-      ["Hips","RightUpperLeg"],["RightUpperLeg","RightLowerLeg"],
-      ["RightLowerLeg","RightFoot"],["RightFoot","RightToes"],
+      ["Chest","Neck"],
+      ["UpperChest","LeftShoulder"],["LeftShoulder","LeftUpperArm"],["LeftUpperArm","LeftLowerArm"],["LeftLowerArm","LeftHand"],
+      ["UpperChest","RightShoulder"],["RightShoulder","RightUpperArm"],["RightUpperArm","RightLowerArm"],["RightLowerArm","RightHand"],
+      ["Chest","LeftShoulder"],["Chest","RightShoulder"],
+      ["Hips","LeftUpperLeg"],["LeftUpperLeg","LeftLowerLeg"],["LeftLowerLeg","LeftFoot"],["LeftFoot","LeftToes"],
+      ["Hips","RightUpperLeg"],["RightUpperLeg","RightLowerLeg"],["RightLowerLeg","RightFoot"],["RightFoot","RightToes"],
     ];
 
     function getBoneColor(name) {
-      if (name.startsWith("Left") || name === "TrackLHand")  return 0xff6b6b;
-      if (name.startsWith("Right") || name === "TrackRHand") return 0x69ff96;
+      if (name.startsWith("Left")) return 0xff6b6b;
+      if (name.startsWith("Right")) return 0x69ff96;
       if (name === "Hips") return 0xffe066;
-      if (name.startsWith("Track")) return 0xff69ff;
       return 0x00e5ff;
     }
 
-    // ========== CSV parser (legacy) ==========
+    // ========== Segment detection: time gaps > threshold split into separate recordings ==========
+    const TIME_GAP_THRESHOLD = 5.0; // seconds of unity_time gap to split
+
+    function detectSegments(text) {
+      const logTsPattern = /^(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})/;
+      const framePattern = /\[MOTIONLOG\] F:(\d+) T:([-\d.]+) P:(\d+)/;
+      const boneLoggerFramePattern = /\[BoneLogger\] Frame:(\d+) Time:([-\d.]+)/;
+      const sessionStartPattern = /\[MOTIONLOG\] SESSION_START/;
+
+      const frameEntries = []; // { lineIdx, unityTime, logTs }
+      let lastLogTs = "";
+
+      const lines = text.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const tsMatch = line.match(logTsPattern);
+        if (tsMatch) lastLogTs = tsMatch[1];
+
+        const fm = line.match(framePattern);
+        if (fm) {
+          frameEntries.push({ lineIdx: i, unityTime: parseFloat(fm[2]), logTs: lastLogTs });
+          continue;
+        }
+        const bfm = line.match(boneLoggerFramePattern);
+        if (bfm) {
+          frameEntries.push({ lineIdx: i, unityTime: parseFloat(bfm[2]), logTs: lastLogTs });
+        }
+      }
+
+      if (frameEntries.length === 0) return [{ startLine: 0, endLine: lines.length - 1, logTs: "", durationSec: 0 }];
+
+      // Detect splits: SESSION_START or time gap or time reset
+      const segments = [];
+      let segStart = 0;
+      for (let i = 1; i < frameEntries.length; i++) {
+        const dt = frameEntries[i].unityTime - frameEntries[i - 1].unityTime;
+        // Time went backwards (reset) or large gap
+        if (dt < -1.0 || dt > TIME_GAP_THRESHOLD) {
+          segments.push({
+            startLine: frameEntries[segStart].lineIdx,
+            endLine: frameEntries[i - 1].lineIdx,
+            logTs: frameEntries[segStart].logTs,
+            durationSec: frameEntries[i - 1].unityTime - frameEntries[segStart].unityTime,
+          });
+          segStart = i;
+        }
+      }
+      // Last segment
+      segments.push({
+        startLine: frameEntries[segStart].lineIdx,
+        endLine: frameEntries[frameEntries.length - 1].lineIdx,
+        logTs: frameEntries[segStart].logTs,
+        durationSec: frameEntries[frameEntries.length - 1].unityTime - frameEntries[segStart].unityTime,
+      });
+
+      return segments;
+    }
+
+    function formatLogTs(logTs) {
+      // "2026.04.16 14:30:45" -> "2026/04/16 14:30"
+      if (!logTs || logTs.length < 16) return "Unknown";
+      return logTs.replace(/\./g, "/").substring(0, 16);
+    }
+
+    function formatDuration(sec) {
+      if (sec < 60) return sec.toFixed(0) + "s";
+      const m = Math.floor(sec / 60);
+      const s = Math.round(sec % 60);
+      return m + "m" + (s > 0 ? s + "s" : "");
+    }
+
+    // ========== Parsers ==========
     function parseCSV(text) {
       const lines = text.trim().split(/\r?\n/);
       const headers = lines[0].split(",");
-      const data = [];
+      const rows = [];
       for (let i = 1; i < lines.length; i++) {
         const vals = lines[i].split(",");
         if (vals.length < headers.length) continue;
         const row = {};
         headers.forEach((h, j) => { row[h.trim()] = vals[j]?.trim(); });
-        data.push(row);
+        rows.push(row);
       }
-      return { rows: data, players: ["0"], playerNames: { "0": "Player" } };
+      return { rows, players: ["0"], playerNames: { "0": "Player" } };
     }
 
-    // ========== Legacy [BoneLogger] parser ==========
-    function parseBoneLoggerFormat(text) {
+    function parseBoneLoggerFormat(textBlock) {
       const framePattern = /\[BoneLogger\] Frame:(\d+) Time:([-\d.]+)/;
       const bonePattern = /\[BoneLogger\] (\w+) \| pos\(([-\d.]+),([-\d.]+),([-\d.]+)\) \| rot\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\)/;
       const rows = [];
       let currentFrame = null, currentTime = null;
-      for (const line of text.split(/\r?\n/)) {
+      for (const line of textBlock.split(/\r?\n/)) {
         const fm = line.match(framePattern);
         if (fm) { currentFrame = fm[1]; currentTime = fm[2]; continue; }
         const bm = line.match(bonePattern);
@@ -74,78 +138,35 @@
             pos_x: bm[2], pos_y: bm[3], pos_z: bm[4], rot_x: bm[5], rot_y: bm[6], rot_z: bm[7], rot_w: bm[8] });
         }
       }
-      return { rows, players: ["0"], playerNames: { "0": "Player" }, sessions: [], events: [] };
+      return { rows, players: ["0"], playerNames: { "0": "Player" } };
     }
 
-    // ========== New [MOTIONLOG] parser ==========
-    function parseMotionLog(text) {
+    function parseMotionLogBlock(textBlock) {
       const framePattern = /\[MOTIONLOG\] F:(\d+) T:([-\d.]+) P:(\d+)/;
       const bonePattern  = /\[MOTIONLOG\] B P:(\d+) (\w+) pos\(([-\d.]+),([-\d.]+),([-\d.]+)\) rot\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\)/;
       const trackPattern = /\[MOTIONLOG\] T P:(\d+) (\w+) pos\(([-\d.]+),([-\d.]+),([-\d.]+)\) rot\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\)/;
       const playerPattern = /\[MOTIONLOG\] PLAYER ID:(\d+) Name:(.+?) IsVR:(true|false)/;
-      const sessionPattern = /\[MOTIONLOG\] SESSION_(START|STOP)/;
-      const eventPattern = /\[MOTIONLOG\] EVENT (.+?) T:([-\d.]+)/;
 
       const rows = [];
       const playerSet = new Set();
       const playerNames = {};
-      const sessions = [];
-      const events = [];
 
-      for (const line of text.split(/\r?\n/)) {
-        // Player info
+      // First pass: collect player info and build rows (without frame assignment)
+      for (const line of textBlock.split(/\r?\n/)) {
         const pm = line.match(playerPattern);
-        if (pm) {
-          playerSet.add(pm[1]);
-          playerNames[pm[1]] = pm[2].trim();
-          continue;
-        }
-
-        // Session
-        const sm = line.match(sessionPattern);
-        if (sm) { sessions.push({ type: sm[1], line }); continue; }
-
-        // Event
-        const em = line.match(eventPattern);
-        if (em) { events.push({ text: em[1], time: parseFloat(em[2]) }); continue; }
-
-        // Frame header
-        const fm = line.match(framePattern);
-        if (fm) { playerSet.add(fm[3]); continue; }
-
-        // Bone data
+        if (pm) { playerSet.add(pm[1]); playerNames[pm[1]] = pm[2].trim(); continue; }
         const bm = line.match(bonePattern);
-        if (bm) {
-          playerSet.add(bm[1]);
-          rows.push({ frame: null, unity_time: null, player_id: bm[1], bone: bm[2],
-            pos_x: bm[3], pos_y: bm[4], pos_z: bm[5], rot_x: bm[6], rot_y: bm[7], rot_z: bm[8], rot_w: bm[9] });
-          continue;
-        }
-
-        // Tracking data (treated as bone)
+        if (bm) { playerSet.add(bm[1]); rows.push({ frame: null, unity_time: null, player_id: bm[1], bone: bm[2], pos_x: bm[3], pos_y: bm[4], pos_z: bm[5], rot_x: bm[6], rot_y: bm[7], rot_z: bm[8], rot_w: bm[9] }); continue; }
         const tm = line.match(trackPattern);
-        if (tm) {
-          playerSet.add(tm[1]);
-          rows.push({ frame: null, unity_time: null, player_id: tm[1], bone: tm[2],
-            pos_x: tm[3], pos_y: tm[4], pos_z: tm[5], rot_x: tm[6], rot_y: tm[7], rot_z: tm[8], rot_w: tm[9] });
-        }
+        if (tm) { playerSet.add(tm[1]); rows.push({ frame: null, unity_time: null, player_id: tm[1], bone: tm[2], pos_x: tm[3], pos_y: tm[4], pos_z: tm[5], rot_x: tm[6], rot_y: tm[7], rot_z: tm[8], rot_w: tm[9] }); }
       }
 
-      // Assign frame numbers from frame headers
-      let curFrame = 0, curTime = 0, curPlayer = "0";
-      let rowIdx = 0;
-      for (const line of text.split(/\r?\n/)) {
+      // Second pass: assign frame/time
+      let curFrame = 0, curTime = 0, rowIdx = 0;
+      for (const line of textBlock.split(/\r?\n/)) {
         const fm = line.match(framePattern);
-        if (fm) { curFrame = parseInt(fm[1]); curTime = parseFloat(fm[2]); curPlayer = fm[3]; continue; }
-        const bm = line.match(bonePattern);
-        if (bm && rowIdx < rows.length) {
-          rows[rowIdx].frame = curFrame.toString();
-          rows[rowIdx].unity_time = curTime.toString();
-          rowIdx++;
-          continue;
-        }
-        const tm = line.match(trackPattern);
-        if (tm && rowIdx < rows.length) {
+        if (fm) { curFrame = parseInt(fm[1]); curTime = parseFloat(fm[2]); continue; }
+        if ((line.match(bonePattern) || line.match(trackPattern)) && rowIdx < rows.length) {
           rows[rowIdx].frame = curFrame.toString();
           rows[rowIdx].unity_time = curTime.toString();
           rowIdx++;
@@ -153,106 +174,80 @@
       }
 
       const players = Array.from(playerSet).sort((a, b) => parseInt(a) - parseInt(b));
-      return { rows, players, playerNames, sessions, events };
+      return { rows, players, playerNames };
     }
 
-    // ========== Auto-detect and parse ==========
-    function parseVRChatLog(text) {
-      if (text.includes("[MOTIONLOG]")) return parseMotionLog(text);
-      return parseBoneLoggerFormat(text);
-    }
-
-    // ========== Build frames for a specific player ==========
     function buildFrames(rows, playerId) {
       const filtered = playerId ? rows.filter(r => r.player_id === playerId) : rows;
       const frameMap = new Map();
       for (const row of filtered) {
         const f = parseInt(row.frame);
         if (isNaN(f)) continue;
-        // Skip tracking data (TrackHead etc.) - only show bone data
         if (row.bone && row.bone.startsWith("Track")) continue;
-        if (!frameMap.has(f)) {
-          frameMap.set(f, { frame: f, time: parseFloat(row.unity_time), bones: {} });
-        }
-        frameMap.get(f).bones[row.bone] = {
-          x: parseFloat(row.pos_x), y: parseFloat(row.pos_y), z: parseFloat(row.pos_z),
-        };
+        if (!frameMap.has(f)) frameMap.set(f, { frame: f, time: parseFloat(row.unity_time), bones: {} });
+        frameMap.get(f).bones[row.bone] = { x: parseFloat(row.pos_x), y: parseFloat(row.pos_y), z: parseFloat(row.pos_z) };
       }
       return Array.from(frameMap.values()).sort((a, b) => a.frame - b.frame);
     }
 
+    // ==================== MAIN COMPONENT ====================
     function BoneViewer() {
-      const mountRef  = useRef(null);
-      const logInputRef = useRef(null);
-      const sceneRef  = useRef(null);
-      const rendRef   = useRef(null);
-      const cameraRef = useRef(null);
+      const mountRef = useRef(null), logInputRef = useRef(null);
+      const sceneRef = useRef(null), rendRef = useRef(null), cameraRef = useRef(null);
       const frameObjs = useRef({ joints: {}, bones: {} });
-      const gridRef   = useRef(null);
+      const gridRef = useRef(null);
       const lastMouse = useRef({ x: 0, y: 0 });
       const spherical = useRef({ theta: 0.4, phi: 1.2, radius: 3 });
-      const lookTarget= useRef(new THREE.Vector3(0, 1, 0));
-      const animRef   = useRef(null);
-      const playRef   = useRef(false);
-      const dragMode  = useRef(null);
-      const playStartWall     = useRef(null);
-      const playStartDataTime = useRef(null);
-      const playModeRef       = useRef("fps");
-      const playSpeedRef      = useRef(1);
-      const followModeRef     = useRef(true);
+      const lookTarget = useRef(new THREE.Vector3(0, 1, 0));
+      const animRef = useRef(null), playRef = useRef(false), dragMode = useRef(null);
+      const playStartWall = useRef(null), playStartDataTime = useRef(null);
+      const playModeRef = useRef("fps"), playSpeedRef = useRef(1), followModeRef = useRef(true);
 
-      const [allRows, setAllRows]           = useState([]);
-      const [players, setPlayers]           = useState([]);
-      const [playerNames, setPlayerNames]   = useState({});
+      // Segments (parsed from log)
+      const [segments, setSegments] = useState([]); // { startLine, endLine, logTs, durationSec }
+      const [selectedSeg, setSelectedSeg] = useState(0);
+      const [parsedSeg, setParsedSeg] = useState(null); // { rows, players, playerNames }
+      const [rawText, setRawText] = useState("");
+
+      const [players, setPlayers] = useState([]);
+      const [playerNames, setPlayerNames] = useState({});
       const [selectedPlayer, setSelectedPlayer] = useState("0");
-      const [sessionInfo, setSessionInfo]   = useState([]);
-      const [eventLog, setEventLog]         = useState([]);
-      const [frames, setFrames]             = useState([]);
-      const [current, setCurrent]           = useState(0);
-      const [playing, setPlaying]           = useState(false);
-      const [fps, setFps]                   = useState(30);
-      const [playMode, setPlayMode]         = useState("fps");
-      const [playSpeed, setPlaySpeed]       = useState(1);
-      const [loaded, setLoaded]             = useState(false);
-      const [fileName, setFileName]         = useState("");
-      const [followMode, setFollowMode]     = useState(true);
+      const [frames, setFrames] = useState([]);
+      const [current, setCurrent] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const [fps, setFps] = useState(30);
+      const [playMode, setPlayMode] = useState("fps");
+      const [playSpeed, setPlaySpeed] = useState(1);
+      const [loaded, setLoaded] = useState(false);
+      const [fileName, setFileName] = useState("");
+      const [followMode, setFollowMode] = useState(true);
 
       useEffect(() => { followModeRef.current = followMode; }, [followMode]);
-      useEffect(() => { playModeRef.current   = playMode;   }, [playMode]);
-      useEffect(() => { playSpeedRef.current  = playSpeed;  }, [playSpeed]);
-      useEffect(() => { playRef.current       = playing;    }, [playing]);
+      useEffect(() => { playModeRef.current = playMode; }, [playMode]);
+      useEffect(() => { playSpeedRef.current = playSpeed; }, [playSpeed]);
+      useEffect(() => { playRef.current = playing; }, [playing]);
 
       // Three.js init
       useEffect(() => {
-        const W = mountRef.current.clientWidth;
-        const H = mountRef.current.clientHeight;
+        const W = mountRef.current.clientWidth, H = mountRef.current.clientHeight;
         const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-        renderer.setSize(W, H); renderer.setPixelRatio(window.devicePixelRatio);
-        renderer.setClearColor(0x000000, 0);
-        mountRef.current.appendChild(renderer.domElement);
-        rendRef.current = renderer;
+        renderer.setSize(W, H); renderer.setPixelRatio(window.devicePixelRatio); renderer.setClearColor(0x000000, 0);
+        mountRef.current.appendChild(renderer.domElement); rendRef.current = renderer;
         const scene = new THREE.Scene(); sceneRef.current = scene;
-        const grid = new THREE.GridHelper(10, 20, 0x1a2a3a, 0x0d1a24);
-        grid.position.y = -0.05; scene.add(grid); gridRef.current = grid;
+        const grid = new THREE.GridHelper(10, 20, 0x1a2a3a, 0x0d1a24); grid.position.y = -0.05; scene.add(grid); gridRef.current = grid;
         scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-        const dir = new THREE.DirectionalLight(0x88ccff, 1.2);
-        dir.position.set(3, 5, 3); scene.add(dir);
+        const dir = new THREE.DirectionalLight(0x88ccff, 1.2); dir.position.set(3, 5, 3); scene.add(dir);
         const camera = new THREE.PerspectiveCamera(50, W / H, 0.01, 100);
-        camera.position.set(0, 1.2, 3); camera.lookAt(0, 1, 0);
-        cameraRef.current = camera;
+        camera.position.set(0, 1.2, 3); camera.lookAt(0, 1, 0); cameraRef.current = camera;
         const animate = () => { animRef.current = requestAnimationFrame(animate); renderer.render(scene, camera); };
         animate();
-        const onResize = () => {
-          const w = mountRef.current?.clientWidth || W;
-          const h = mountRef.current?.clientHeight || H;
-          renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
-        };
+        const onResize = () => { const w = mountRef.current?.clientWidth || W; const h = mountRef.current?.clientHeight || H; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); };
         window.addEventListener("resize", onResize);
         return () => { cancelAnimationFrame(animRef.current); window.removeEventListener("resize", onResize); renderer.dispose(); mountRef.current?.removeChild(renderer.domElement); };
       }, []);
 
       const updateCamera = useCallback(() => {
-        const s = spherical.current; const t = lookTarget.current; const cam = cameraRef.current;
+        const s = spherical.current, t = lookTarget.current, cam = cameraRef.current;
         if (!cam) return;
         cam.position.set(t.x + s.radius * Math.sin(s.phi) * Math.sin(s.theta), t.y + s.radius * Math.cos(s.phi), t.z + s.radius * Math.sin(s.phi) * Math.cos(s.theta));
         cam.lookAt(t);
@@ -261,19 +256,20 @@
       const onMouseDown = (e) => { if (e.button === 2) { dragMode.current = "rotate"; e.preventDefault(); } if (e.button === 1) { dragMode.current = "pan"; e.preventDefault(); } lastMouse.current = { x: e.clientX, y: e.clientY }; };
       const onMouseMove = useCallback((e) => {
         if (!dragMode.current) return;
-        const dx = e.clientX - lastMouse.current.x; const dy = e.clientY - lastMouse.current.y;
+        const dx = e.clientX - lastMouse.current.x, dy = e.clientY - lastMouse.current.y;
         lastMouse.current = { x: e.clientX, y: e.clientY };
         if (dragMode.current === "rotate") { const s = spherical.current; s.theta -= dx * 0.005; s.phi = Math.max(0.1, Math.min(Math.PI - 0.1, s.phi - dy * 0.005)); updateCamera(); }
-        if (dragMode.current === "pan") { const cam = cameraRef.current; if (!cam) return; const s = spherical.current; const right = new THREE.Vector3(); const up = new THREE.Vector3(); right.setFromMatrixColumn(cam.matrix, 0); up.setFromMatrixColumn(cam.matrix, 1); const ps = s.radius * 0.001; lookTarget.current.addScaledVector(right, -dx * ps); lookTarget.current.addScaledVector(up, dy * ps); updateCamera(); }
+        if (dragMode.current === "pan") { const cam = cameraRef.current; if (!cam) return; const s = spherical.current; const r = new THREE.Vector3(), u = new THREE.Vector3(); r.setFromMatrixColumn(cam.matrix, 0); u.setFromMatrixColumn(cam.matrix, 1); const ps = s.radius * 0.001; lookTarget.current.addScaledVector(r, -dx * ps); lookTarget.current.addScaledVector(u, dy * ps); updateCamera(); }
       }, [updateCamera]);
       const onMouseUp = (e) => { if (e.button === 2 || e.button === 1) dragMode.current = null; };
-      const onWheel = (e) => { const s = spherical.current; s.radius = Math.max(0.5, Math.min(12, s.radius + e.deltaY * 0.005)); updateCamera(); };
+      const onWheel = (e) => { spherical.current.radius = Math.max(0.5, Math.min(12, spherical.current.radius + e.deltaY * 0.005)); updateCamera(); };
       const onContextMenu = (e) => e.preventDefault();
 
       const initSkeleton = useCallback(() => {
         const scene = sceneRef.current; if (!scene) return;
         Object.values(frameObjs.current.joints).forEach(o => scene.remove(o));
         Object.values(frameObjs.current.bones).forEach(o => scene.remove(o));
+        const nl = frameObjs.current.nameLabel;
         frameObjs.current = { joints: {}, bones: {} };
         const allBones = new Set();
         BONE_CONNECTIONS.forEach(([a, b]) => { allBones.add(a); allBones.add(b); });
@@ -283,20 +279,6 @@
           const mesh = new THREE.Mesh(geo, mat); mesh.visible = false; scene.add(mesh);
           frameObjs.current.joints[name] = mesh;
         });
-        // Player name label sprite (above head)
-        if (!frameObjs.current.nameLabel) {
-          const canvas = document.createElement("canvas");
-          canvas.width = 256; canvas.height = 64;
-          const tex = new THREE.CanvasTexture(canvas);
-          const spriteMat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
-          const sprite = new THREE.Sprite(spriteMat);
-          sprite.scale.set(0.6, 0.15, 1);
-          sprite.visible = false;
-          scene.add(sprite);
-          frameObjs.current.nameLabel = sprite;
-          frameObjs.current.nameLabelCanvas = canvas;
-          frameObjs.current.nameLabelTex = tex;
-        }
         BONE_CONNECTIONS.forEach(([a, b]) => {
           const key = `${a}-${b}`;
           const geo = new THREE.CylinderGeometry(0.006, 0.006, 1, 8);
@@ -304,18 +286,26 @@
           const mesh = new THREE.Mesh(geo, mat); mesh.visible = false; scene.add(mesh);
           frameObjs.current.bones[key] = mesh;
         });
+        // Reuse or create name label
+        if (nl) { frameObjs.current.nameLabel = nl; frameObjs.current.nameLabelCanvas = nl._canvas; frameObjs.current.nameLabelTex = nl._tex; }
+        else {
+          const canvas = document.createElement("canvas"); canvas.width = 256; canvas.height = 64;
+          const tex = new THREE.CanvasTexture(canvas);
+          const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+          sprite.scale.set(0.6, 0.15, 1); sprite.visible = false; scene.add(sprite);
+          sprite._canvas = canvas; sprite._tex = tex;
+          frameObjs.current.nameLabel = sprite; frameObjs.current.nameLabelCanvas = canvas; frameObjs.current.nameLabelTex = tex;
+        }
       }, []);
 
       const updateNameLabel = useCallback((text) => {
-        const canvas = frameObjs.current.nameLabelCanvas;
-        const tex = frameObjs.current.nameLabelTex;
+        const canvas = frameObjs.current.nameLabelCanvas, tex = frameObjs.current.nameLabelTex;
         if (!canvas || !tex) return;
         const ctx = canvas.getContext("2d");
         ctx.clearRect(0, 0, 256, 64);
         ctx.fillStyle = "rgba(0,0,0,0.5)";
-        ctx.roundRect(0, 8, 256, 48, 8); ctx.fill();
-        ctx.font = "bold 24px 'Courier New', monospace";
-        ctx.fillStyle = "#00e5ff";
+        ctx.beginPath(); ctx.roundRect(0, 8, 256, 48, 8); ctx.fill();
+        ctx.font = "bold 24px 'Courier New', monospace"; ctx.fillStyle = "#00e5ff";
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
         ctx.fillText(text, 128, 32, 250);
         tex.needsUpdate = true;
@@ -323,17 +313,16 @@
 
       const renderFrame = useCallback((frameData) => {
         if (!frameData) return;
-        const bones = frameData.bones; const jo = frameObjs.current.joints; const bo = frameObjs.current.bones;
+        const bones = frameData.bones, jo = frameObjs.current.joints, bo = frameObjs.current.bones;
         const hip = bones["Hips"];
         if (hip && followModeRef.current) { lookTarget.current.set(hip.x, hip.y, hip.z); updateCamera(); }
         Object.entries(jo).forEach(([name, mesh]) => {
-          if (name.startsWith("Track")) { mesh.visible = false; return; } // Skip tracking points
           const b = bones[name];
           if (b && !(b.x === 0 && b.y === 0 && b.z === 0)) { mesh.position.set(b.x, b.y, b.z); mesh.visible = true; }
           else { mesh.visible = false; }
         });
         BONE_CONNECTIONS.forEach(([a, b]) => {
-          const key = `${a}-${b}`; const ma = jo[a], mb = jo[b]; const cyl = bo[key];
+          const key = `${a}-${b}`, ma = jo[a], mb = jo[b], cyl = bo[key];
           if (!cyl || !ma?.visible || !mb?.visible) { if (cyl) cyl.visible = false; return; }
           const pa = ma.position, pb = mb.position;
           const mid = new THREE.Vector3().addVectors(pa, pb).multiplyScalar(0.5);
@@ -343,55 +332,87 @@
           cyl.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3().subVectors(pb, pa).normalize());
           cyl.visible = true;
         });
-        // Name label above head
         const nameSprite = frameObjs.current.nameLabel;
         const head = bones["Head"];
-        if (nameSprite && head && !(head.x === 0 && head.y === 0 && head.z === 0)) {
-          nameSprite.position.set(head.x, head.y + 0.25, head.z);
-          nameSprite.visible = true;
-        } else if (nameSprite) {
-          nameSprite.visible = false;
-        }
+        if (nameSprite && head && !(head.x === 0 && head.y === 0 && head.z === 0)) { nameSprite.position.set(head.x, head.y + 0.25, head.z); nameSprite.visible = true; }
+        else if (nameSprite) { nameSprite.visible = false; }
       }, [updateCamera]);
 
       useEffect(() => { if (frames.length > 0 && frames[current]) renderFrame(frames[current]); }, [current, frames, renderFrame]);
 
-      // Player change -> rebuild frames + update name label
+      // ========== Segment selection -> parse segment -> rebuild frames ==========
       useEffect(() => {
-        if (allRows.length === 0) return;
-        const f = buildFrames(allRows, selectedPlayer);
-        setFrames(f); setCurrent(0); setPlaying(false);
-        initSkeleton();
-        const label = playerNames[selectedPlayer] || `Player ${selectedPlayer}`;
-        updateNameLabel(label);
-      }, [selectedPlayer, allRows, playerNames, initSkeleton, updateNameLabel]);
+        if (!rawText || segments.length === 0) return;
+        const seg = segments[selectedSeg];
+        if (!seg) return;
 
-      const applyParsed = useCallback((parsed, sourceFileName) => {
-        setAllRows(parsed.rows);
-        setPlayers(parsed.players || ["0"]);
-        setPlayerNames(parsed.playerNames || {});
-        setSessionInfo(parsed.sessions || []);
-        setEventLog(parsed.events || []);
-        const firstPlayer = (parsed.players && parsed.players.length > 0) ? parsed.players[0] : "0";
-        setSelectedPlayer(firstPlayer);
-        const f = buildFrames(parsed.rows, firstPlayer);
-        setFrames(f); setCurrent(0); setLoaded(f.length > 0); setFileName(sourceFileName);
+        const lines = rawText.split(/\r?\n/);
+        const block = lines.slice(seg.startLine, seg.endLine + 500).join("\n"); // include trailing bone data
+
+        let parsed;
+        if (block.includes("[MOTIONLOG]")) parsed = parseMotionLogBlock(block);
+        else parsed = parseBoneLoggerFormat(block);
+
+        setParsedSeg(parsed);
+        setPlayers(parsed.players);
+        setPlayerNames(parsed.playerNames);
+        const firstP = parsed.players.length > 0 ? parsed.players[0] : "0";
+        setSelectedPlayer(firstP);
+        const f = buildFrames(parsed.rows, firstP);
+        setFrames(f); setCurrent(0); setPlaying(false); setLoaded(f.length > 0);
         initSkeleton();
+        updateNameLabel(parsed.playerNames[firstP] || `Player ${firstP}`);
+
         // Grid
         const scene = sceneRef.current;
         if (scene && gridRef.current && f.length > 0) {
-          let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, cx = 0, cz = 0, count = 0;
-          for (const frame of f) { const hip = frame.bones["Hips"]; if (!hip) continue; minX = Math.min(minX, hip.x); maxX = Math.max(maxX, hip.x); minZ = Math.min(minZ, hip.z); maxZ = Math.max(maxZ, hip.z); cx += hip.x; cz += hip.z; count++; }
-          if (count > 0) { cx /= count; cz /= count; const rawSize = Math.max(maxX - minX, maxZ - minZ, 4) * 1.5; const gs = Math.ceil(rawSize / 0.5) * 0.5; scene.remove(gridRef.current); const ng = new THREE.GridHelper(gs, Math.round(gs / 0.5), 0x1a2a3a, 0x0d1a24); ng.position.set(cx, -0.05, cz); scene.add(ng); gridRef.current = ng; }
+          let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, cx = 0, cz = 0, cnt = 0;
+          for (const fr of f) { const h = fr.bones["Hips"]; if (!h) continue; minX = Math.min(minX, h.x); maxX = Math.max(maxX, h.x); minZ = Math.min(minZ, h.z); maxZ = Math.max(maxZ, h.z); cx += h.x; cz += h.z; cnt++; }
+          if (cnt > 0) { cx /= cnt; cz /= cnt; const gs = Math.ceil(Math.max(maxX - minX, maxZ - minZ, 4) * 1.5 / 0.5) * 0.5; scene.remove(gridRef.current); const ng = new THREE.GridHelper(gs, Math.round(gs / 0.5), 0x1a2a3a, 0x0d1a24); ng.position.set(cx, -0.05, cz); scene.add(ng); gridRef.current = ng; }
         }
-      }, [initSkeleton]);
+      }, [selectedSeg, segments, rawText, initSkeleton, updateNameLabel]);
 
-      const readTextFile = (file) => new Promise((resolve, reject) => { const r = new FileReader(); r.onload = (e) => resolve(e.target.result || ""); r.onerror = reject; r.readAsText(file, "utf-8"); });
-      const handleCSVFile = async (e) => { const f = e.target.files[0]; if (!f) return; const t = await readTextFile(f); applyParsed(parseCSV(t), f.name); e.target.value = ""; };
-      const handleLogFile = async (e) => { const f = e.target.files[0]; if (!f) return; const t = await readTextFile(f); applyParsed(parseVRChatLog(t), f.name); e.target.value = ""; };
-      const openVRChatLogPicker = async () => {
+      // Player change
+      useEffect(() => {
+        if (!parsedSeg) return;
+        const f = buildFrames(parsedSeg.rows, selectedPlayer);
+        setFrames(f); setCurrent(0); setPlaying(false);
+        initSkeleton();
+        updateNameLabel(playerNames[selectedPlayer] || `Player ${selectedPlayer}`);
+      }, [selectedPlayer, parsedSeg, playerNames, initSkeleton, updateNameLabel]);
+
+      // File load
+      const readTextFile = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = e => res(e.target.result || ""); r.onerror = rej; r.readAsText(file, "utf-8"); });
+
+      const handleFile = async (file) => {
+        const text = await readTextFile(file);
+        setRawText(text);
+        setFileName(file.name);
+
+        if (file.name.endsWith(".csv")) {
+          const parsed = parseCSV(text);
+          setParsedSeg(parsed);
+          setSegments([{ startLine: 0, endLine: 0, logTs: "", durationSec: 0 }]);
+          setSelectedSeg(0);
+          setPlayers(parsed.players); setPlayerNames(parsed.playerNames);
+          setSelectedPlayer("0");
+          const f = buildFrames(parsed.rows, "0");
+          setFrames(f); setCurrent(0); setLoaded(f.length > 0);
+          initSkeleton();
+          return;
+        }
+
+        const segs = detectSegments(text);
+        setSegments(segs);
+        setSelectedSeg(0);
+        // Segment 0 will be parsed by the useEffect above
+      };
+
+      const handleCSVFile = async (e) => { const f = e.target.files[0]; if (f) await handleFile(f); e.target.value = ""; };
+      const handleLogFile = async (e) => { const f = e.target.files[0]; if (f) await handleFile(f); e.target.value = ""; };
+      const openLogPicker = async () => {
         if (window.showOpenFilePicker) {
-          try { const [h] = await window.showOpenFilePicker({ id: "vrchat-log-picker", startIn: "documents", multiple: false, types: [{ description: "VRChat logs", accept: { "text/plain": [".txt", ".log"] } }] }); const f = await h.getFile(); const t = await readTextFile(f); applyParsed(parseVRChatLog(t), f.name); return; } catch (err) { if (err?.name === "AbortError") return; }
+          try { const [h] = await window.showOpenFilePicker({ id: "vrchat-log", startIn: "documents", types: [{ description: "VRChat logs", accept: { "text/plain": [".txt",".log"] } }] }); await handleFile(await h.getFile()); return; } catch(e) { if (e?.name === "AbortError") return; }
         }
         logInputRef.current?.click();
       };
@@ -399,12 +420,12 @@
       // Playback
       useEffect(() => { if (playing && frames.length > 0) { playStartWall.current = performance.now(); playStartDataTime.current = frames[current]?.time ?? 0; } }, [playing]);
       useEffect(() => {
-        if (!playing || frames.length === 0 || playMode !== "fps") return;
+        if (!playing || !frames.length || playMode !== "fps") return;
         const iv = setInterval(() => { if (!playRef.current) return; setCurrent(c => { const n = c + 1; if (n >= frames.length) { setPlaying(false); return c; } return n; }); }, 1000 / fps);
         return () => clearInterval(iv);
       }, [playing, frames.length, fps, playMode]);
       useEffect(() => {
-        if (!playing || frames.length === 0 || playMode !== "realtime") return;
+        if (!playing || !frames.length || playMode !== "realtime") return;
         const times = frames.map(f => f.time);
         const tick = () => { if (!playRef.current) return; const el = (performance.now() - playStartWall.current) / 1000 * playSpeedRef.current; const tt = playStartDataTime.current + el; if (tt >= times[times.length - 1]) { setPlaying(false); setCurrent(frames.length - 1); return; } let lo = 0, hi = times.length - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (times[m] < tt) lo = m + 1; else hi = m; } setCurrent(lo); rafId = requestAnimationFrame(tick); };
         let rafId = requestAnimationFrame(tick);
@@ -412,41 +433,37 @@
       }, [playing, frames, playMode]);
 
       const frameData = frames[current];
-      const getDataFps = (idx) => { if (frames.length < 2 || idx < 0 || idx >= frames.length) return null; const p = Math.max(0, idx - 1); const n = Math.min(frames.length - 1, idx + 1); let dt = frames[idx].time - frames[p].time; if (dt <= 0 && n !== idx) dt = frames[n].time - frames[idx].time; if (dt <= 0) return null; return 1 / dt; };
-      const dataFps = getDataFps(current);
+      const dataFps = (() => { if (frames.length < 2 || current < 0 || current >= frames.length) return null; const p = Math.max(0, current - 1); let dt = frames[current].time - frames[p].time; if (dt <= 0) { const n = Math.min(frames.length - 1, current + 1); dt = frames[n].time - frames[current].time; } return dt > 0 ? 1 / dt : null; })();
       const pName = playerNames[selectedPlayer] || `Player ${selectedPlayer}`;
 
       return (
         <div style={{ width:"100vw", height:"100vh", background:"#060d14", display:"flex", flexDirection:"column", fontFamily:"'Courier New', monospace", color:"#7ecfff", overflow:"hidden" }}>
           {/* Header */}
-          <div style={{ padding:"10px 20px", borderBottom:"1px solid #0d2535", display:"flex", alignItems:"center", gap:20, background:"rgba(0,20,35,0.9)", backdropFilter:"blur(8px)", zIndex:10 }}>
+          <div style={{ padding:"10px 20px", borderBottom:"1px solid #0d2535", display:"flex", alignItems:"center", gap:20, background:"rgba(0,20,35,0.9)", zIndex:10 }}>
             <div style={{ fontSize:13, letterSpacing:3, color:"#00e5ff", fontWeight:"bold" }}>BONE VIEWER</div>
-            <div style={{ fontSize:11, color:"#2a5a7a", letterSpacing:1 }}>VRChat Motion Capture</div>
+            <div style={{ fontSize:11, color:"#2a5a7a" }}>VRChat Motion Capture</div>
             <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:12 }}>
-              {/* Player selector */}
               {players.length > 1 && (
                 <select value={selectedPlayer} onChange={e => setSelectedPlayer(e.target.value)}>
-                  {players.map(pid => (
-                    <option key={pid} value={pid}>{playerNames[pid] || `Player ${pid}`} (ID:{pid})</option>
-                  ))}
+                  {players.map(pid => <option key={pid} value={pid}>{playerNames[pid] || `Player ${pid}`} (ID:{pid})</option>)}
                 </select>
               )}
               <label style={{ padding:"5px 14px", border:"1px solid #00e5ff", color:"#00e5ff", fontSize:11, letterSpacing:2, cursor:"pointer", background:"rgba(0,229,255,0.05)" }}>
-                CSV LOAD<input type="file" accept=".csv" onChange={handleCSVFile} style={{ display:"none" }} />
+                CSV<input type="file" accept=".csv" onChange={handleCSVFile} style={{ display:"none" }} />
               </label>
-              <button onClick={openVRChatLogPicker} style={{ padding:"5px 14px", border:"1px solid #69ff96", color:"#69ff96", fontSize:11, letterSpacing:2, cursor:"pointer", background:"rgba(105,255,150,0.05)" }}>LOG LOAD</button>
+              <button onClick={openLogPicker} style={{ padding:"5px 14px", border:"1px solid #69ff96", color:"#69ff96", fontSize:11, letterSpacing:2, cursor:"pointer", background:"rgba(105,255,150,0.05)" }}>LOG</button>
               <input ref={logInputRef} type="file" accept=".txt,.log" onChange={handleLogFile} style={{ display:"none" }} />
-              {fileName && <span style={{ fontSize:10, color:"#2a6a8a", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{fileName}</span>}
+              {fileName && <span style={{ fontSize:10, color:"#2a6a8a", maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{fileName}</span>}
             </div>
           </div>
 
-          {/* Main area */}
+          {/* Main */}
           <div style={{ flex:1, display:"flex", position:"relative", overflow:"hidden" }}>
             <div ref={mountRef} style={{ flex:1, background:"linear-gradient(180deg,#060d14 0%,#0a1a2a 100%)", cursor:"default" }}
               onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp} onWheel={onWheel} onContextMenu={onContextMenu} />
 
-            {/* Info panel */}
-            <div style={{ position:"absolute", top:12, left:12, width:200, background:"rgba(6,13,20,0.85)", border:"1px solid #0d2535", backdropFilter:"blur(6px)", padding:"12px 14px", fontSize:10, lineHeight:2, letterSpacing:1 }}>
+            {/* Info + Segments panel */}
+            <div style={{ position:"absolute", top:12, left:12, width:210, background:"rgba(6,13,20,0.85)", border:"1px solid #0d2535", backdropFilter:"blur(6px)", padding:"12px 14px", fontSize:10, lineHeight:2, letterSpacing:1, maxHeight:"calc(100% - 24px)", overflowY:"auto" }}>
               <div style={{ color:"#00e5ff", marginBottom:6, fontSize:11, letterSpacing:3 }}>INFO</div>
               {players.length > 1 && <div style={{ color:"#69ff96" }}>PLAYER <span style={{ float:"right" }}>{pName}</span></div>}
               <div style={{ color:"#2a6a8a" }}>FRAMES <span style={{ color:"#7ecfff", float:"right" }}>{frames.length}</span></div>
@@ -456,24 +473,45 @@
               <div style={{ color:"#2a6a8a" }}>BONES  <span style={{ color:"#7ecfff", float:"right" }}>{frameData ? Object.keys(frameData.bones).length : 0}</span></div>
               {frameData?.bones?.Hips && (
                 <>
-                  <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid #0d2535", color:"#ffe066", fontSize:9, letterSpacing:2 }}>HIPS (world)</div>
+                  <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid #0d2535", color:"#ffe066", fontSize:9, letterSpacing:2 }}>HIPS</div>
                   <div style={{ color:"#2a6a8a", fontSize:9 }}>X <span style={{ color:"#ffe066", float:"right" }}>{frameData.bones.Hips.x.toFixed(3)}</span></div>
                   <div style={{ color:"#2a6a8a", fontSize:9 }}>Y <span style={{ color:"#ffe066", float:"right" }}>{frameData.bones.Hips.y.toFixed(3)}</span></div>
                   <div style={{ color:"#2a6a8a", fontSize:9 }}>Z <span style={{ color:"#ffe066", float:"right" }}>{frameData.bones.Hips.z.toFixed(3)}</span></div>
                 </>
               )}
+
+              {/* Segment selector */}
+              {segments.length > 0 && (
+                <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid #0d2535" }}>
+                  <div style={{ color:"#00e5ff", fontSize:9, letterSpacing:2, marginBottom:4 }}>RECORDINGS ({segments.length})</div>
+                  {segments.map((seg, i) => (
+                    <button key={i} onClick={() => { setSelectedSeg(i); setPlaying(false); }}
+                      style={{
+                        display:"block", width:"100%", textAlign:"left", marginBottom:3,
+                        padding:"4px 6px", fontSize:9, lineHeight:1.3,
+                        border: `1px solid ${i === selectedSeg ? "#00e5ff" : "#0d2535"}`,
+                        background: i === selectedSeg ? "rgba(0,229,255,0.15)" : "transparent",
+                        color: i === selectedSeg ? "#00e5ff" : "#2a6a8a",
+                        cursor:"pointer", fontFamily:"inherit",
+                      }}>
+                      <div>{formatLogTs(seg.logTs)}</div>
+                      <div style={{ color: i === selectedSeg ? "#7ecfff" : "#1a4060" }}>{formatDuration(seg.durationSec)}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid #0d2535", color:"#1a4060", fontSize:9 }}>
-                RMB drag: rotate<br />MMB drag: pan<br />WHEEL: zoom<br />
-                <span style={{ color: followMode ? "#ffe066" : "#2a6a8a" }}>CAM: {followMode ? "FOLLOW" : "WORLD FIXED"}</span>
+                RMB: rotate / MMB: pan / WHEEL: zoom
               </div>
             </div>
 
             {/* Legend */}
-            <div style={{ position:"absolute", top:12, right:12, background:"rgba(6,13,20,0.85)", border:"1px solid #0d2535", backdropFilter:"blur(6px)", padding:"12px 14px", fontSize:10, letterSpacing:1, lineHeight:2.2 }}>
+            <div style={{ position:"absolute", top:12, right:12, background:"rgba(6,13,20,0.85)", border:"1px solid #0d2535", padding:"12px 14px", fontSize:10, letterSpacing:1, lineHeight:2.2 }}>
               <div style={{ color:"#00e5ff", marginBottom:4, fontSize:11, letterSpacing:3 }}>LEGEND</div>
-              {[["SPINE / HEAD","#00e5ff"],["LEFT","#ff6b6b"],["RIGHT","#69ff96"],["HIPS","#ffe066"]].map(([label, color]) => (
-                <div key={label} style={{ display:"flex", alignItems:"center", gap:8, color:"#2a6a8a" }}>
-                  <div style={{ width:8, height:8, borderRadius:"50%", background:color, boxShadow:`0 0 6px ${color}` }} />{label}
+              {[["SPINE/HEAD","#00e5ff"],["LEFT","#ff6b6b"],["RIGHT","#69ff96"],["HIPS","#ffe066"]].map(([l,c]) => (
+                <div key={l} style={{ display:"flex", alignItems:"center", gap:8, color:"#2a6a8a" }}>
+                  <div style={{ width:8, height:8, borderRadius:"50%", background:c, boxShadow:`0 0 6px ${c}` }} />{l}
                 </div>
               ))}
             </div>
@@ -489,8 +527,7 @@
           {/* Controls */}
           <div style={{ padding:"10px 20px", borderTop:"1px solid #0d2535", background:"rgba(0,10,18,0.95)", display:"flex", flexDirection:"column", gap:8 }}>
             <input type="range" min={0} max={Math.max(0, frames.length - 1)} value={current}
-              onChange={e => { setPlaying(false); setCurrent(Number(e.target.value)); }}
-              style={{ width:"100%", height:3, cursor:"pointer" }} />
+              onChange={e => { setPlaying(false); setCurrent(Number(e.target.value)); }} style={{ width:"100%", height:3, cursor:"pointer" }} />
             <div style={{ display:"flex", alignItems:"center", gap:16 }}>
               <button onClick={() => { if (loaded) setPlaying(p => !p); }}
                 style={{ padding:"5px 20px", border:`1px solid ${playing ? "#ff6b6b" : "#00e5ff"}`, background: playing ? "rgba(255,107,107,0.08)" : "rgba(0,229,255,0.08)", color: playing ? "#ff6b6b" : "#00e5ff", fontSize:11, letterSpacing:3, cursor:"pointer" }}>
@@ -501,20 +538,18 @@
               <button onClick={() => setFollowMode(m => !m)}
                 style={{ padding:"5px 14px", border:`1px solid ${followMode ? "#ffe066" : "#2a6a8a"}`, background: followMode ? "rgba(255,224,102,0.08)" : "transparent", color: followMode ? "#ffe066" : "#2a6a8a", fontSize:10, letterSpacing:2, cursor:"pointer" }}>
                 {followMode ? "⊙ FOLLOW" : "⊙ WORLD"}</button>
-              <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:8, fontSize:10, color:"#2a6a8a", letterSpacing:1 }}>
+              <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:8, fontSize:10, color:"#2a6a8a" }}>
                 {["fps","realtime"].map(m => (
                   <button key={m} onClick={() => { setPlaying(false); setPlayMode(m); }}
-                    style={{ padding:"3px 10px", border:`1px solid ${playMode === m ? "#00e5ff" : "#0d2535"}`, background: playMode === m ? "rgba(0,229,255,0.12)" : "transparent", color: playMode === m ? "#00e5ff" : "#2a6a8a", fontSize:10, cursor:"pointer", letterSpacing:1 }}>
+                    style={{ padding:"3px 10px", border:`1px solid ${playMode === m ? "#00e5ff" : "#0d2535"}`, background: playMode === m ? "rgba(0,229,255,0.12)" : "transparent", color: playMode === m ? "#00e5ff" : "#2a6a8a", fontSize:10, cursor:"pointer" }}>
                     {m === "fps" ? "FPS" : "REALTIME"}</button>
                 ))}
                 <div style={{ width:1, height:14, background:"#0d2535", margin:"0 2px" }} />
                 {playMode === "fps" && [15,30,60,90].map(f => (
-                  <button key={f} onClick={() => setFps(f)}
-                    style={{ padding:"3px 8px", border:`1px solid ${fps === f ? "#00e5ff" : "#0d2535"}`, background: fps === f ? "rgba(0,229,255,0.12)" : "transparent", color: fps === f ? "#00e5ff" : "#2a6a8a", fontSize:10, cursor:"pointer" }}>{f}</button>
+                  <button key={f} onClick={() => setFps(f)} style={{ padding:"3px 8px", border:`1px solid ${fps === f ? "#00e5ff" : "#0d2535"}`, background: fps === f ? "rgba(0,229,255,0.12)" : "transparent", color: fps === f ? "#00e5ff" : "#2a6a8a", fontSize:10, cursor:"pointer" }}>{f}</button>
                 ))}
                 {playMode === "realtime" && [0.25,0.5,1,2].map(sp => (
-                  <button key={sp} onClick={() => setPlaySpeed(sp)}
-                    style={{ padding:"3px 8px", border:`1px solid ${playSpeed === sp ? "#69ff96" : "#0d2535"}`, background: playSpeed === sp ? "rgba(105,255,150,0.10)" : "transparent", color: playSpeed === sp ? "#69ff96" : "#2a6a8a", fontSize:10, cursor:"pointer" }}>{sp}x</button>
+                  <button key={sp} onClick={() => setPlaySpeed(sp)} style={{ padding:"3px 8px", border:`1px solid ${playSpeed === sp ? "#69ff96" : "#0d2535"}`, background: playSpeed === sp ? "rgba(105,255,150,0.10)" : "transparent", color: playSpeed === sp ? "#69ff96" : "#2a6a8a", fontSize:10, cursor:"pointer" }}>{sp}x</button>
                 ))}
               </div>
             </div>
